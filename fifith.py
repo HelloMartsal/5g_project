@@ -3,10 +3,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
-import json
 
-# === Load data ===
+import json
+import pandas as pd
+
 file_path = 'aggregated_hourlyGridActivity_with_features.json'
+
+# Load JSON lines safely
 data = []
 with open(file_path, 'r') as f:
     for line in f:
@@ -14,55 +17,62 @@ with open(file_path, 'r') as f:
             data.append(json.loads(line))
         except json.JSONDecodeError:
             print("⚠️ Skipping malformed line:", line.strip())
+
 df = pd.DataFrame(data)
 
-# === Setup ===
+
+
+# === 1. Load and preprocess data ===
+df = pd.read_json('aggregated_hourlyGridActivity_with_features.json', orient='records', lines=True)
+df['startTime'] = pd.to_datetime(df['startTime'])
+df.set_index('startTime', inplace=True)
+
+# Set frequency and fill gaps
+df = df.asfreq('h')
+df = df.ffill()
+
+print(f"Total rows in dataset: {len(df)}")
+
+
+# === 2. Define target ===
 target_col = 'internet'
-total_rows = len(df)
-train_end = int(total_rows * 0.7)
 
-train_df = df.iloc[:train_end]
-test_df = df.iloc[train_end:]
+# === 3. Train/test split (last 7 days for testing) ===
+train = df.iloc[:-24*7]
+test = df.iloc[-24*7:]
 
-rolling_window = 24 * 7  # 7 days
-forecast_horizon = 24  # Forecast 7 days ahead
+# === 4. Fit SARIMA model (no exogenous features) ===
+model = SARIMAX(train[target_col],
+                order=(0, 1, 2),
+                seasonal_order=(2, 1, 2, 24),
+                enforce_stationarity=False,
+                enforce_invertibility=False)
 
-rolling_forecasts = []
-actuals = []
+try:
+    results = model.fit(disp=False)
+except Exception as e:
+    print("Model fitting failed:", e)
+    exit()
 
-# === Rolling forecast loop ===
-for start in range(0, len(test_df) - forecast_horizon + 1, forecast_horizon):
-    train_data = pd.concat([train_df, test_df.iloc[:start]])  # up to current test window
-    test_data = test_df.iloc[start:start + forecast_horizon]
+# === 5. Forecast and score ===
+forecast = results.predict(start=test.index[0], end=test.index[-1])
 
-    model = SARIMAX(train_data[target_col],
-                    order=(0, 1, 2),
-                    seasonal_order=(2, 1, 2, 24),
-                    enforce_stationarity=False,
-                    enforce_invertibility=False)
+# Clip forecast to test set length
+forecast = forecast[:len(test)]
 
-    try:
-        results = model.fit(disp=False)
-        forecast = results.predict(start=len(train_data), end=len(train_data) + forecast_horizon - 1)
-        rolling_forecasts.extend(forecast)
-        actuals.extend(test_data[target_col].values)
-    except Exception as e:
-        print(f"Model failed at window starting {start}: {e}")
-        continue
+rmse = np.sqrt(mean_squared_error(test[target_col], forecast))
+mape = mean_absolute_percentage_error(test[target_col], forecast)
 
-# === Evaluate ===
-rmse = np.sqrt(mean_squared_error(actuals, rolling_forecasts))
-mape = mean_absolute_percentage_error(actuals, rolling_forecasts)
+print(f'✅ RMSE: {rmse:.2f}')
+print(f'✅ MAPE: {mape*100:.2f}%')
 
-print(f'✅ Rolling RMSE: {rmse:.2f}')
-print(f'✅ Rolling MAPE: {mape * 100:.2f}%')
-
-# === Plot results ===
+# === 6. Plot results ===
 plt.figure(figsize=(14, 6))
-plt.plot(range(len(actuals)), actuals, label='Actual', color='black')
-plt.plot(range(len(rolling_forecasts)), rolling_forecasts, label='Forecast', color='red')
-plt.title('Rolling Forecast (7-day Window)')
-plt.xlabel('Hour Index')
+plt.plot(train.index[-48:], train[target_col].iloc[-48:], label='Train (last 2 days)', alpha=0.6)
+plt.plot(test.index, test[target_col], label='Actual', color='black')
+plt.plot(test.index, forecast, label='Forecast', color='red')
+plt.title('Actual vs Forecast (No Exogenous Features)')
+plt.xlabel('Time')
 plt.ylabel('Internet Usage')
 plt.legend()
 plt.grid(True)
